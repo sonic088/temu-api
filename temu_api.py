@@ -100,7 +100,7 @@ def success_response(data, meta=None):
 # ───────────────────────────────────────────────
 # SearchAPI.io Request Helper
 # ───────────────────────────────────────────────
-def searchapi_request(engine, params, timeout=15):
+def searchapi_request(engine, params, timeout=45):
     """Make request to SearchAPI.io"""
 
     if not SEARCHAPI_KEY:
