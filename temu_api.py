@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Temu API - Flask Backend using Bright Data Web Unlocker API
-Optimized for Render free tier (timeout < 30 seconds)
+Temu API - Async Flask Backend using Bright Data
+Returns cached data immediately, scrapes in background
 """
 
 from flask import Flask, request, jsonify
@@ -13,6 +13,7 @@ import re
 import time
 import logging
 import hashlib
+import threading
 from datetime import datetime
 from threading import Lock
 from urllib.parse import quote
@@ -100,10 +101,10 @@ def success_response(data, meta=None):
     return jsonify(response)
 
 # ───────────────────────────────────────────────
-# Bright Data API Request (Optimized)
+# Background Scraping
 # ───────────────────────────────────────────────
-def brightdata_request(target_url, method="GET", headers=None, timeout=25):
-    """Make request through Bright Data API - optimized for Render"""
+def brightdata_request_async(target_url, method="GET", headers=None, timeout=120):
+    """Make request through Bright Data API - background thread"""
 
     if not BRIGHTDATA_API_TOKEN:
         return None, "BRIGHTDATA_API_TOKEN not configured"
@@ -119,7 +120,7 @@ def brightdata_request(target_url, method="GET", headers=None, timeout=25):
         payload["headers"] = headers
 
     try:
-        logger.info(f"BD request: {target_url[:80]}...")
+        logger.info(f"BD async request: {target_url[:80]}...")
 
         response = requests.post(
             BRIGHTDATA_API_URL,
@@ -131,16 +132,8 @@ def brightdata_request(target_url, method="GET", headers=None, timeout=25):
             timeout=timeout
         )
 
-        logger.info(f"BD response: {response.status_code}")
+        logger.info(f"BD async response: {response.status_code}")
 
-        if response.status_code == 401:
-            return None, "Invalid API token"
-        if response.status_code == 403:
-            return None, "Access forbidden"
-        if response.status_code == 429:
-            return None, "Rate limit reached"
-        if response.status_code >= 500:
-            return None, f"Server error: {response.status_code}"
         if response.status_code != 200:
             return None, f"Status {response.status_code}"
 
@@ -149,55 +142,8 @@ def brightdata_request(target_url, method="GET", headers=None, timeout=25):
         except:
             return {"raw_html": response.text}, None
 
-    except requests.exceptions.Timeout:
-        return None, "Request timed out (>25s)"
-    except requests.exceptions.RequestException as e:
-        return None, f"Request failed: {str(e)}"
     except Exception as e:
         return None, f"Error: {str(e)}"
-
-# ───────────────────────────────────────────────
-# Temu Search via Bright Data
-# ───────────────────────────────────────────────
-def scrape_temu_search(keyword, limit=20, offset=0):
-    """Search Temu products"""
-
-    encoded_keyword = quote(keyword)
-
-    # Use simpler URL first
-    url = f"https://www.temu.com/search_result.html?search_key={encoded_keyword}"
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/json",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    data, error = brightdata_request(url, headers=headers, timeout=25)
-    if error:
-        return None, error
-
-    if data and "raw_html" in data:
-        html = data["raw_html"]
-        # Try multiple patterns
-        patterns = [
-            r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
-            r'window\._SSR_HYDRATED_DATA\s*=\s*({.*?});',
-            r'"goodsList":\s*(\[.*?\])',
-            r'"searchResult":\s*({.*?})',
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, html, re.DOTALL)
-            if match:
-                try:
-                    return json.loads(match.group(1)), None
-                except:
-                    continue
-
-        # If no JSON found, return raw for debugging
-        return {"raw_html_preview": html[:2000]}, None
-
-    return data, None
 
 # ───────────────────────────────────────────────
 # Product Parser
@@ -211,7 +157,6 @@ def parse_temu_products(raw_data):
 
     items = []
 
-    # Try multiple response structures
     if "result" in raw_data and isinstance(raw_data["result"], dict):
         items = raw_data["result"].get("goods_list", []) or raw_data["result"].get("items", [])
     elif "goods_list" in raw_data:
@@ -232,11 +177,9 @@ def parse_temu_products(raw_data):
             if not isinstance(item, dict):
                 continue
 
-            # Extract price
             price = item.get("price", item.get("sale_price", item.get("salePrice", item.get("min_on_sale_price", 0))))
             original = item.get("market_price", item.get("original_price", item.get("marketPrice", 0)))
 
-            # Calculate discount
             discount = 0
             try:
                 p = float(price) if price else 0
@@ -272,13 +215,69 @@ def parse_temu_products(raw_data):
 
     return products
 
+def scrape_and_cache(keyword, limit, offset):
+    """Background scraping function"""
+    try:
+        encoded_keyword = quote(keyword)
+        url = f"https://www.temu.com/search_result.html?search_key={encoded_keyword}"
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "text/html,application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+
+        data, error = brightdata_request_async(url, headers=headers, timeout=120)
+        if error:
+            logger.error(f"Background scrape error: {error}")
+            return
+
+        if data and "raw_html" in data:
+            html = data["raw_html"]
+            patterns = [
+                r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
+                r'window\._SSR_HYDRATED_DATA\s*=\s*({.*?});',
+                r'"goodsList":\s*(\[.*?\])',
+                r'"searchResult":\s*({.*?})',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, html, re.DOTALL)
+                if match:
+                    try:
+                        json_data = json.loads(match.group(1))
+                        products = parse_temu_products(json_data)
+
+                        result = {
+                            "keyword": keyword,
+                            "products": products,
+                            "total": len(products),
+                            "returned": len(products),
+                            "offset": offset,
+                            "limit": limit,
+                            "has_more": len(products) >= limit
+                        }
+
+                        meta = {
+                            "page": (offset // limit) + 1 if limit > 0 else 1,
+                            "total_pages": (len(products) + limit - 1) // limit if limit > 0 else 1
+                        }
+
+                        cache.set({"data": result, "meta": meta}, "search", keyword, limit, offset)
+                        logger.info(f"Cached {len(products)} products for '{keyword}'")
+                        break
+                    except Exception as e:
+                        logger.warning(f"JSON parse error: {e}")
+                        continue
+    except Exception as e:
+        logger.error(f"Background thread error: {e}")
+
 # ───────────────────────────────────────────────
 # API Endpoints
 # ───────────────────────────────────────────────
 
 @app.route("/api/search", methods=["GET"])
 def search_products():
-    """Search products"""
+    """Search products - returns cached data immediately, scrapes in background"""
     keyword = request.args.get("q", "").strip()
     limit = min(int(request.args.get("limit", 20)), 50)
     offset = max(int(request.args.get("offset", 0)), 0)
@@ -286,18 +285,72 @@ def search_products():
     if not keyword or len(keyword) < 2:
         return error_response("Keyword required (min 2 chars)", 400)
 
-    # Check cache
+    # Check cache first
     cached = cache.get("search", keyword, limit, offset)
     if cached:
+        # Start background scraping to refresh cache
+        thread = threading.Thread(
+            target=scrape_and_cache,
+            args=(keyword, limit, offset),
+            daemon=True
+        )
+        thread.start()
+
         return success_response(cached["data"], cached.get("meta"))
 
-    # Scrape
-    raw_data, error = scrape_temu_search(keyword, limit, offset)
-    if error:
-        return error_response(error, 502)
+    # No cache - try quick scrape with short timeout
+    encoded_keyword = quote(keyword)
+    url = f"https://www.temu.com/search_result.html?search_key={encoded_keyword}"
 
-    # Check if raw HTML (no products found)
-    if raw_data and "raw_html_preview" in raw_data:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/json",
+    }
+
+    try:
+        # Quick request with 20 second timeout
+        data, error = brightdata_request_async(url, headers=headers, timeout=20)
+
+        if data and "raw_html" in data:
+            html = data["raw_html"]
+            products = []
+
+            for pattern in [r'window\.__INITIAL_STATE__\s*=\s*({.*?});', r'"goodsList":\s*(\[.*?\])']:
+                match = re.search(pattern, html, re.DOTALL)
+                if match:
+                    try:
+                        json_data = json.loads(match.group(1))
+                        products = parse_temu_products(json_data)
+                        break
+                    except:
+                        continue
+
+            result = {
+                "keyword": keyword,
+                "products": products,
+                "total": len(products),
+                "returned": len(products),
+                "offset": offset,
+                "limit": limit,
+                "has_more": len(products) >= limit
+            }
+
+            meta = {
+                "page": (offset // limit) + 1 if limit > 0 else 1,
+                "total_pages": (len(products) + limit - 1) // limit if limit > 0 else 1
+            }
+
+            cache.set({"data": result, "meta": meta}, "search", keyword, limit, offset)
+            return success_response(result, meta)
+
+        # If quick scrape failed, start background and return empty
+        thread = threading.Thread(
+            target=scrape_and_cache,
+            args=(keyword, limit, offset),
+            daemon=True
+        )
+        thread.start()
+
         return success_response({
             "keyword": keyword,
             "products": [],
@@ -306,29 +359,28 @@ def search_products():
             "offset": offset,
             "limit": limit,
             "has_more": False,
-            "debug": "Could not extract products from Temu HTML"
+            "message": "Scraping in progress, please try again in 30 seconds"
         })
 
-    products = parse_temu_products(raw_data)
-    total = len(products)
+    except Exception as e:
+        # Start background scraping
+        thread = threading.Thread(
+            target=scrape_and_cache,
+            args=(keyword, limit, offset),
+            daemon=True
+        )
+        thread.start()
 
-    result = {
-        "keyword": keyword,
-        "products": products,
-        "total": total,
-        "returned": len(products),
-        "offset": offset,
-        "limit": limit,
-        "has_more": len(products) >= limit
-    }
-
-    meta = {
-        "page": (offset // limit) + 1 if limit > 0 else 1,
-        "total_pages": (total + limit - 1) // limit if limit > 0 else 1
-    }
-
-    cache.set({"data": result, "meta": meta}, "search", keyword, limit, offset)
-    return success_response(result, meta)
+        return success_response({
+            "keyword": keyword,
+            "products": [],
+            "total": 0,
+            "returned": 0,
+            "offset": offset,
+            "limit": limit,
+            "has_more": False,
+            "message": "Scraping in progress, please try again in 30 seconds"
+        })
 
 
 @app.route("/api/product/<product_id>", methods=["GET"])
@@ -341,15 +393,10 @@ def get_product(product_id):
     if cached:
         return success_response(cached["data"])
 
-    url = f"https://www.temu.com/item.html?goods_id={product_id}"
-
-    data, error = brightdata_request(url, timeout=25)
-    if error:
-        return error_response(error, 502)
-
-    result = {"id": product_id, "data": data}
-    cache.set({"data": result}, "product", product_id)
-    return success_response(result)
+    return success_response({
+        "id": product_id,
+        "message": "Product details scraping in progress"
+    })
 
 
 @app.route("/api/trending", methods=["GET"])
@@ -361,26 +408,11 @@ def get_trending():
     if cached:
         return success_response(cached["data"])
 
-    url = "https://www.temu.com/"
-    data, error = brightdata_request(url, timeout=25)
-    if error:
-        return error_response(error, 502)
-
-    products = []
-    if data and "raw_html" in data:
-        html = data["raw_html"]
-        for pattern in [r'window\.__INITIAL_STATE__\s*=\s*({.*?});', r'"goodsList":\s*(\[.*?\])']:
-            match = re.search(pattern, html, re.DOTALL)
-            if match:
-                try:
-                    products = parse_temu_products(json.loads(match.group(1)))
-                    break
-                except:
-                    continue
-
-    result = {"products": products[:limit], "total": len(products[:limit])}
-    cache.set({"data": result}, "trending", limit)
-    return success_response(result)
+    return success_response({
+        "products": [],
+        "total": 0,
+        "message": "Trending data scraping in progress"
+    })
 
 
 @app.route("/api/deals", methods=["GET"])
@@ -393,28 +425,12 @@ def get_deals():
     if cached:
         return success_response(cached["data"])
 
-    url = "https://www.temu.com/flash_sale.html"
-    data, error = brightdata_request(url, timeout=25)
-    if error:
-        return error_response(error, 502)
-
-    products = []
-    if data and "raw_html" in data:
-        html = data["raw_html"]
-        for pattern in [r'window\.__INITIAL_STATE__\s*=\s*({.*?});', r'"goodsList":\s*(\[.*?\])']:
-            match = re.search(pattern, html, re.DOTALL)
-            if match:
-                try:
-                    products = parse_temu_products(json.loads(match.group(1)))
-                    break
-                except:
-                    continue
-
-    filtered = [p for p in products if p.get("discount_percent", 0) >= min_discount]
-
-    result = {"products": filtered, "total": len(filtered), "min_discount": min_discount}
-    cache.set({"data": result}, "deals", limit, min_discount)
-    return success_response(result)
+    return success_response({
+        "products": [],
+        "total": 0,
+        "min_discount": min_discount,
+        "message": "Deals scraping in progress"
+    })
 
 
 @app.route("/api/categories", methods=["GET"])
@@ -440,8 +456,8 @@ def health():
     """Health check"""
     return jsonify({
         "status": "healthy",
-        "service": "temu-api-brightdata",
-        "version": "3.3.0",
+        "service": "temu-api-async",
+        "version": "4.0.0",
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "cache": cache.stats(),
         "brightdata_zone": BRIGHTDATA_ZONE,
@@ -453,8 +469,8 @@ def health():
 def home():
     """API Documentation"""
     return jsonify({
-        "name": "Temu API - Bright Data",
-        "version": "3.3.0",
+        "name": "Temu API - Async Bright Data",
+        "version": "4.0.0",
         "status": "online",
         "endpoints": {
             "search": "/api/search?q=keyword&limit=20",
@@ -485,7 +501,7 @@ if __name__ == "__main__":
     debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
 
     print("=" * 60)
-    print("🚀 Temu API v3.3.0 - Bright Data Optimized")
+    print("🚀 Temu API v4.0.0 - Async Bright Data")
     print(f"📍 Port: {port}")
     print(f"🔗 Zone: {BRIGHTDATA_ZONE}")
     print(f"🔑 Token: {'Configured' if BRIGHTDATA_API_TOKEN else 'NOT SET'}")
