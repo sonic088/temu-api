@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Temu API - Flask Backend using Bright Data Web Unlocker API
-Uses Bright Data's API endpoint directly - NO proxy needed
+Optimized for Render free tier (timeout < 30 seconds)
 """
 
 from flask import Flask, request, jsonify
@@ -34,19 +34,17 @@ app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # ───────────────────────────────────────────────
-# Bright Data Web Unlocker API Configuration
+# Bright Data Configuration
 # ───────────────────────────────────────────────
 BRIGHTDATA_API_TOKEN = os.environ.get("BRIGHTDATA_API_TOKEN", "")
 BRIGHTDATA_ZONE = os.environ.get("BRIGHTDATA_ZONE", "web_unlocker2")
-
-# Bright Data Web Unlocker API endpoint
 BRIGHTDATA_API_URL = "https://api.brightdata.com/request"
 
 # ───────────────────────────────────────────────
 # Cache System
 # ───────────────────────────────────────────────
 class Cache:
-    def __init__(self, duration=300, max_size=1000):
+    def __init__(self, duration=600, max_size=500):
         self._cache = {}
         self._lock = Lock()
         self.duration = duration
@@ -75,17 +73,9 @@ class Cache:
                 del self._cache[oldest]
             self._cache[key] = (time.time(), data)
 
-    def clear(self):
-        with self._lock:
-            self._cache.clear()
-
     def stats(self):
         with self._lock:
-            return {
-                "size": len(self._cache),
-                "max_size": self.max_size,
-                "duration": self.duration
-            }
+            return {"size": len(self._cache), "max_size": self.max_size}
 
 cache = Cache()
 
@@ -110,10 +100,10 @@ def success_response(data, meta=None):
     return jsonify(response)
 
 # ───────────────────────────────────────────────
-# Bright Data Web Unlocker API Request
+# Bright Data API Request (Optimized)
 # ───────────────────────────────────────────────
-def brightdata_request(target_url, method="GET", headers=None, timeout=60):
-    """Make request through Bright Data Web Unlocker API"""
+def brightdata_request(target_url, method="GET", headers=None, timeout=25):
+    """Make request through Bright Data API - optimized for Render"""
 
     if not BRIGHTDATA_API_TOKEN:
         return None, "BRIGHTDATA_API_TOKEN not configured"
@@ -129,7 +119,7 @@ def brightdata_request(target_url, method="GET", headers=None, timeout=60):
         payload["headers"] = headers
 
     try:
-        logger.info(f"Bright Data request: {target_url[:100]}...")
+        logger.info(f"BD request: {target_url[:80]}...")
 
         response = requests.post(
             BRIGHTDATA_API_URL,
@@ -141,31 +131,26 @@ def brightdata_request(target_url, method="GET", headers=None, timeout=60):
             timeout=timeout
         )
 
-        logger.info(f"Bright Data response status: {response.status_code}")
+        logger.info(f"BD response: {response.status_code}")
 
         if response.status_code == 401:
             return None, "Invalid API token"
-
         if response.status_code == 403:
-            return None, "Access forbidden - check zone permissions"
-
+            return None, "Access forbidden"
         if response.status_code == 429:
             return None, "Rate limit reached"
-
         if response.status_code >= 500:
             return None, f"Server error: {response.status_code}"
-
         if response.status_code != 200:
             return None, f"Status {response.status_code}"
 
-        # Try JSON first
         try:
             return response.json(), None
         except:
             return {"raw_html": response.text}, None
 
     except requests.exceptions.Timeout:
-        return None, "Request timed out"
+        return None, "Request timed out (>25s)"
     except requests.exceptions.RequestException as e:
         return None, f"Request failed: {str(e)}"
     except Exception as e:
@@ -175,97 +160,104 @@ def brightdata_request(target_url, method="GET", headers=None, timeout=60):
 # Temu Search via Bright Data
 # ───────────────────────────────────────────────
 def scrape_temu_search(keyword, limit=20, offset=0):
-    """Search Temu products using Bright Data"""
+    """Search Temu products"""
 
     encoded_keyword = quote(keyword)
 
-    urls = [
-        f"https://www.temu.com/api/search?search_key={encoded_keyword}&page={offset//limit + 1}&size={limit}",
-        f"https://www.temu.com/search_result.html?search_key={encoded_keyword}",
-    ]
+    # Use simpler URL first
+    url = f"https://www.temu.com/search_result.html?search_key={encoded_keyword}"
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/html, */*",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/json",
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    for url in urls:
-        data, error = brightdata_request(url, headers=headers)
-        if error:
-            logger.warning(f"URL failed: {url[:80]}... | Error: {error}")
-            continue
+    data, error = brightdata_request(url, headers=headers, timeout=25)
+    if error:
+        return None, error
 
-        if data:
-            if isinstance(data, dict) and ("goods_list" in data or "items" in data or "result" in data):
-                return data, None
+    if data and "raw_html" in data:
+        html = data["raw_html"]
+        # Try multiple patterns
+        patterns = [
+            r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
+            r'window\._SSR_HYDRATED_DATA\s*=\s*({.*?});',
+            r'"goodsList":\s*(\[.*?\])',
+            r'"searchResult":\s*({.*?})',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(1)), None
+                except:
+                    continue
 
-            if "raw_html" in data:
-                html = data["raw_html"]
-                patterns = [
-                    r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
-                    r'window\._SSR_HYDRATED_DATA\s*=\s*({.*?});',
-                    r'"goodsList":\s*(\[.*?\])',
-                ]
-                for pattern in patterns:
-                    match = re.search(pattern, html, re.DOTALL)
-                    if match:
-                        try:
-                            json_data = json.loads(match.group(1))
-                            return json_data, None
-                        except:
-                            continue
+        # If no JSON found, return raw for debugging
+        return {"raw_html_preview": html[:2000]}, None
 
-    return None, "Could not fetch products from Temu"
+    return data, None
 
 # ───────────────────────────────────────────────
 # Product Parser
 # ───────────────────────────────────────────────
 def parse_temu_products(raw_data):
-    """Parse Temu response into standardized format"""
+    """Parse Temu response"""
     products = []
 
-    if not raw_data:
+    if not raw_data or not isinstance(raw_data, dict):
         return products
 
     items = []
 
-    if isinstance(raw_data, dict):
-        if "result" in raw_data and isinstance(raw_data["result"], dict):
-            items = raw_data["result"].get("goods_list", []) or raw_data["result"].get("items", [])
-        elif "goods_list" in raw_data:
-            items = raw_data["goods_list"]
-        elif "items" in raw_data:
-            items = raw_data["items"]
-        elif "data" in raw_data and isinstance(raw_data["data"], dict):
-            items = raw_data["data"].get("goods_list", []) or raw_data["data"].get("items", [])
-        elif "data" in raw_data and isinstance(raw_data["data"], list):
-            items = raw_data["data"]
-        elif "goodsList" in raw_data:
-            items = raw_data["goodsList"]
-        elif "searchResult" in raw_data:
-            items = raw_data["searchResult"].get("goodsList", [])
-    elif isinstance(raw_data, list):
-        items = raw_data
+    # Try multiple response structures
+    if "result" in raw_data and isinstance(raw_data["result"], dict):
+        items = raw_data["result"].get("goods_list", []) or raw_data["result"].get("items", [])
+    elif "goods_list" in raw_data:
+        items = raw_data["goods_list"]
+    elif "items" in raw_data:
+        items = raw_data["items"]
+    elif "data" in raw_data and isinstance(raw_data["data"], dict):
+        items = raw_data["data"].get("goods_list", []) or raw_data["data"].get("items", [])
+    elif "data" in raw_data and isinstance(raw_data["data"], list):
+        items = raw_data["data"]
+    elif "goodsList" in raw_data:
+        items = raw_data["goodsList"]
+    elif "searchResult" in raw_data:
+        items = raw_data["searchResult"].get("goodsList", [])
 
     for item in items:
         try:
             if not isinstance(item, dict):
                 continue
 
+            # Extract price
+            price = item.get("price", item.get("sale_price", item.get("salePrice", item.get("min_on_sale_price", 0))))
+            original = item.get("market_price", item.get("original_price", item.get("marketPrice", 0)))
+
+            # Calculate discount
+            discount = 0
+            try:
+                p = float(price) if price else 0
+                o = float(original) if original else 0
+                if o > 0 and p > 0 and o > p:
+                    discount = round((1 - p / o) * 100)
+            except:
+                pass
+
             product = {
                 "id": str(item.get("goods_id", item.get("id", item.get("goodsId", "")))),
-                "title": item.get("goods_name", item.get("title", item.get("goodsName", "Untitled Product"))),
-                "price": str(item.get("price", item.get("sale_price", item.get("min_on_sale_price", item.get("salePrice", "N/A"))))),
-                "original_price": str(item.get("market_price", item.get("original_price", item.get("marketPrice", "")))),
-                "discount_percent": 0,
+                "title": item.get("goods_name", item.get("title", item.get("goodsName", "Product"))),
+                "price": str(price) if price else "N/A",
+                "original_price": str(original) if original else "",
+                "discount_percent": discount,
                 "currency": item.get("currency", "USD"),
                 "rating": round(float(item.get("avg_star", item.get("rating", item.get("avgStar", 0))) or 0), 1),
                 "review_count": int(item.get("comment_num", item.get("review_count", item.get("commentNum", 0))) or 0),
                 "sold_count": str(item.get("sales_tip", item.get("sold_count", item.get("salesTip", "")))),
                 "thumbnail": item.get("thumb_url", item.get("image", item.get("img_url", item.get("thumbUrl", "")))),
                 "product_url": f"https://www.temu.com/item.html?goods_id={item.get('goods_id', item.get('id', item.get('goodsId', '')))}",
-                "shipping_days": item.get("shipping_days", ""),
                 "category": item.get("cat_id", item.get("category", "")),
                 "shop_name": item.get("mall_name", item.get("shop_name", item.get("mallName", ""))),
                 "shop_rating": item.get("mall_rating", item.get("shop_rating", 0)),
@@ -273,17 +265,9 @@ def parse_temu_products(raw_data):
                 "tags": item.get("tag_list", item.get("tags", [])) or []
             }
 
-            try:
-                price = float(product["price"]) if product["price"] and product["price"] != "N/A" else 0
-                original = float(product["original_price"]) if product["original_price"] else 0
-                if original > 0 and price > 0 and original > price:
-                    product["discount_percent"] = round((1 - price / original) * 100)
-            except:
-                pass
-
             products.append(product)
         except Exception as e:
-            logger.warning(f"Failed to parse product: {e}")
+            logger.warning(f"Parse error: {e}")
             continue
 
     return products
@@ -294,25 +278,36 @@ def parse_temu_products(raw_data):
 
 @app.route("/api/search", methods=["GET"])
 def search_products():
-    """Search products on Temu"""
+    """Search products"""
     keyword = request.args.get("q", "").strip()
     limit = min(int(request.args.get("limit", 20)), 50)
     offset = max(int(request.args.get("offset", 0)), 0)
-    sort = request.args.get("sort", "relevance")
 
-    if not keyword:
-        return error_response("Search keyword is required", 400)
+    if not keyword or len(keyword) < 2:
+        return error_response("Keyword required (min 2 chars)", 400)
 
-    if len(keyword) < 2:
-        return error_response("Keyword must be at least 2 characters", 400)
-
-    cached = cache.get("search", keyword, limit, offset, sort)
+    # Check cache
+    cached = cache.get("search", keyword, limit, offset)
     if cached:
         return success_response(cached["data"], cached.get("meta"))
 
+    # Scrape
     raw_data, error = scrape_temu_search(keyword, limit, offset)
     if error:
         return error_response(error, 502)
+
+    # Check if raw HTML (no products found)
+    if raw_data and "raw_html_preview" in raw_data:
+        return success_response({
+            "keyword": keyword,
+            "products": [],
+            "total": 0,
+            "returned": 0,
+            "offset": offset,
+            "limit": limit,
+            "has_more": False,
+            "debug": "Could not extract products from Temu HTML"
+        })
 
     products = parse_temu_products(raw_data)
     total = len(products)
@@ -332,7 +327,7 @@ def search_products():
         "total_pages": (total + limit - 1) // limit if limit > 0 else 1
     }
 
-    cache.set({"data": result, "meta": meta}, "search", keyword, limit, offset, sort)
+    cache.set({"data": result, "meta": meta}, "search", keyword, limit, offset)
     return success_response(result, meta)
 
 
@@ -340,7 +335,7 @@ def search_products():
 def get_product(product_id):
     """Get product details"""
     if not product_id:
-        return error_response("Product ID is required", 400)
+        return error_response("Product ID required", 400)
 
     cached = cache.get("product", product_id)
     if cached:
@@ -348,67 +343,18 @@ def get_product(product_id):
 
     url = f"https://www.temu.com/item.html?goods_id={product_id}"
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-
-    data, error = brightdata_request(url, headers=headers)
+    data, error = brightdata_request(url, timeout=25)
     if error:
         return error_response(error, 502)
 
-    if "raw_html" in data:
-        html = data["raw_html"]
-        patterns = [
-            r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
-            r'window\._SSR_HYDRATED_DATA\s*=\s*({.*?});',
-        ]
-        product_data = None
-        for pattern in patterns:
-            match = re.search(pattern, html, re.DOTALL)
-            if match:
-                try:
-                    product_data = json.loads(match.group(1))
-                    break
-                except:
-                    continue
-
-        if product_data:
-            result = {
-                "id": product_id,
-                "title": product_data.get("goodsName", product_data.get("title", "Untitled")),
-                "description": product_data.get("goodsDesc", product_data.get("description", "")),
-                "price": str(product_data.get("salePrice", product_data.get("price", "N/A"))),
-                "original_price": str(product_data.get("marketPrice", product_data.get("original_price", ""))),
-                "currency": "USD",
-                "rating": round(float(product_data.get("avgStar", product_data.get("rating", 0)) or 0), 1),
-                "review_count": int(product_data.get("commentNum", product_data.get("review_count", 0)) or 0),
-                "sold_count": str(product_data.get("salesTip", product_data.get("sold_count", ""))),
-                "thumbnail": product_data.get("thumbUrl", product_data.get("thumbnail", "")),
-                "images": product_data.get("viewImageList", product_data.get("images", [])),
-                "shop": {
-                    "name": product_data.get("mallName", product_data.get("shop_name", "")),
-                    "rating": product_data.get("mallRating", product_data.get("shop_rating", 0)),
-                },
-                "shipping": {
-                    "free": product_data.get("isFreeShipping", product_data.get("free_shipping", False)),
-                },
-                "specifications": product_data.get("specs", product_data.get("specifications", {})),
-                "reviews": [],
-                "tags": product_data.get("tagList", product_data.get("tags", []))
-            }
-        else:
-            result = {"id": product_id, "error": "Could not extract product data"}
-    else:
-        result = {"id": product_id, "data": data}
-
+    result = {"id": product_id, "data": data}
     cache.set({"data": result}, "product", product_id)
     return success_response(result)
 
 
 @app.route("/api/trending", methods=["GET"])
 def get_trending():
-    """Get trending products"""
+    """Get trending"""
     limit = min(int(request.args.get("limit", 20)), 50)
 
     cached = cache.get("trending", limit)
@@ -416,29 +362,18 @@ def get_trending():
         return success_response(cached["data"])
 
     url = "https://www.temu.com/"
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/json",
-    }
-
-    data, error = brightdata_request(url, headers=headers)
+    data, error = brightdata_request(url, timeout=25)
     if error:
         return error_response(error, 502)
 
     products = []
-    if "raw_html" in data:
+    if data and "raw_html" in data:
         html = data["raw_html"]
-        patterns = [
-            r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
-            r'"goodsList":\s*(\[.*?\])',
-        ]
-        for pattern in patterns:
+        for pattern in [r'window\.__INITIAL_STATE__\s*=\s*({.*?});', r'"goodsList":\s*(\[.*?\])']:
             match = re.search(pattern, html, re.DOTALL)
             if match:
                 try:
-                    json_data = json.loads(match.group(1))
-                    products = parse_temu_products(json_data)
+                    products = parse_temu_products(json.loads(match.group(1)))
                     break
                 except:
                     continue
@@ -459,35 +394,25 @@ def get_deals():
         return success_response(cached["data"])
 
     url = "https://www.temu.com/flash_sale.html"
-
-    data, error = brightdata_request(url)
+    data, error = brightdata_request(url, timeout=25)
     if error:
         return error_response(error, 502)
 
     products = []
-    if "raw_html" in data:
+    if data and "raw_html" in data:
         html = data["raw_html"]
-        patterns = [
-            r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
-            r'"goodsList":\s*(\[.*?\])',
-        ]
-        for pattern in patterns:
+        for pattern in [r'window\.__INITIAL_STATE__\s*=\s*({.*?});', r'"goodsList":\s*(\[.*?\])']:
             match = re.search(pattern, html, re.DOTALL)
             if match:
                 try:
-                    json_data = json.loads(match.group(1))
-                    products = parse_temu_products(json_data)
+                    products = parse_temu_products(json.loads(match.group(1)))
                     break
                 except:
                     continue
 
     filtered = [p for p in products if p.get("discount_percent", 0) >= min_discount]
 
-    result = {
-        "products": filtered,
-        "total": len(filtered),
-        "min_discount": min_discount
-    }
+    result = {"products": filtered, "total": len(filtered), "min_discount": min_discount}
     cache.set({"data": result}, "deals", limit, min_discount)
     return success_response(result)
 
@@ -516,7 +441,7 @@ def health():
     return jsonify({
         "status": "healthy",
         "service": "temu-api-brightdata",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "cache": cache.stats(),
         "brightdata_zone": BRIGHTDATA_ZONE,
@@ -528,24 +453,20 @@ def health():
 def home():
     """API Documentation"""
     return jsonify({
-        "name": "Temu API - Bright Data Web Unlocker",
-        "version": "3.2.0",
+        "name": "Temu API - Bright Data",
+        "version": "3.3.0",
         "status": "online",
-        "provider": "Bright Data",
         "endpoints": {
-            "search": "/api/search?q=keyword&limit=20&offset=0",
-            "product_details": "/api/product/<id>",
+            "search": "/api/search?q=keyword&limit=20",
+            "product": "/api/product/<id>",
             "trending": "/api/trending?limit=20",
-            "deals": "/api/deals?limit=20&min_discount=50",
+            "deals": "/api/deals?limit=20",
             "categories": "/api/categories",
             "health": "/api/health"
         }
     })
 
 
-# ───────────────────────────────────────────────
-# Error Handlers
-# ───────────────────────────────────────────────
 @app.errorhandler(404)
 def not_found(error):
     return error_response("Endpoint not found", 404)
@@ -564,11 +485,10 @@ if __name__ == "__main__":
     debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
 
     print("=" * 60)
-    print("🚀 Temu API v3.2.0 - Bright Data Web Unlocker")
+    print("🚀 Temu API v3.3.0 - Bright Data Optimized")
     print(f"📍 Port: {port}")
-    print(f"🔧 Debug: {debug}")
     print(f"🔗 Zone: {BRIGHTDATA_ZONE}")
-    print(f"🔑 API Token: {'Configured' if BRIGHTDATA_API_TOKEN else 'NOT SET'}")
+    print(f"🔑 Token: {'Configured' if BRIGHTDATA_API_TOKEN else 'NOT SET'}")
     print("=" * 60)
 
     app.run(host="0.0.0.0", port=port, debug=debug)
