@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """
-Temu API - Flask Backend for MCP Integration
-Compatible with Parse.bot scraper API
-Supports: search, product details, images, reviews, recommendations
+Temu API - Flask Backend using Bright Data Web Unlocker
+Scrapes Temu.com directly for real product data
 """
 
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
 import requests
 import json
 import os
+import re
 import time
 import logging
 import hashlib
-from datetime import datetime, timedelta
-from functools import wraps
+from datetime import datetime
 from threading import Lock
+from urllib.parse import quote
 
 # ───────────────────────────────────────────────
-# Logging Configuration
+# Logging
 # ───────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -30,46 +28,30 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ───────────────────────────────────────────────
-# Flask App Initialization
+# Flask App
 # ───────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app, resources={
-    r"/api/*": {
-        "origins": "*",
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type", "Authorization", "X-API-Key"]
-    }
-})
-
-# Rate Limiting
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    default_limits=["200 per day", "50 per hour"],
-    storage_uri="memory://"
-)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # ───────────────────────────────────────────────
-# Configuration
+# Bright Data Configuration
 # ───────────────────────────────────────────────
-PARSE_KEY = os.environ.get("PARSE_KEY", "pmx_f046e920ca7dca177c6153fe8250c830")
-PARSE_API = os.environ.get("PARSE_API", "https://api.parse.bot/scraper/19417d13-c955-4a31-bfb8-d40635cf048d")
+BRIGHTDATA_USERNAME = os.environ.get("BRIGHTDATA_USERNAME", "abdesslam.gh17@gmail.com")
+BRIGHTDATA_PASSWORD = os.environ.get("BRIGHTDATA_PASSWORD", "a0a42834-06a7-4dbf-8b8f-bfef8ddcb187")
+BRIGHTDATA_HOST = os.environ.get("BRIGHTDATA_HOST", "brd.superproxy.io")
+BRIGHTDATA_PORT = os.environ.get("BRIGHTDATA_PORT", "22225")
 
-HEADERS = {
-    "X-API-Key": PARSE_KEY,
-    "Content-Type": "application/json",
-    "Accept": "application/json"
+PROXY_URL = f"http://{BRIGHTDATA_USERNAME}:{BRIGHTDATA_PASSWORD}@{BRIGHTDATA_HOST}:{BRIGHTDATA_PORT}"
+PROXIES = {
+    "http": PROXY_URL,
+    "https": PROXY_URL
 }
 
-# Cache Configuration
-CACHE_DURATION = int(os.environ.get("CACHE_DURATION", 300))  # 5 minutes
-MAX_CACHE_SIZE = int(os.environ.get("MAX_CACHE_SIZE", 1000))
-
 # ───────────────────────────────────────────────
-# Thread-Safe Cache System
+# Cache System
 # ───────────────────────────────────────────────
 class Cache:
-    def __init__(self, duration=CACHE_DURATION, max_size=MAX_CACHE_SIZE):
+    def __init__(self, duration=300, max_size=1000):
         self._cache = {}
         self._lock = Lock()
         self.duration = duration
@@ -85,7 +67,6 @@ class Cache:
             if key in self._cache:
                 cached_time, data = self._cache[key]
                 if time.time() - cached_time < self.duration:
-                    logger.info(f"Cache HIT for key: {key[:8]}...")
                     return data
                 else:
                     del self._cache[key]
@@ -98,40 +79,23 @@ class Cache:
                 oldest = min(self._cache, key=lambda k: self._cache[k][0])
                 del self._cache[oldest]
             self._cache[key] = (time.time(), data)
-            logger.info(f"Cache SET for key: {key[:8]}...")
-
-    def clear(self):
-        with self._lock:
-            self._cache.clear()
-
-    def stats(self):
-        with self._lock:
-            return {
-                "size": len(self._cache),
-                "max_size": self.max_size,
-                "duration": self.duration
-            }
 
 cache = Cache()
 
 # ───────────────────────────────────────────────
-# Error Response Helper
+# Response Helpers
 # ───────────────────────────────────────────────
-def error_response(message, status_code=500, details=None):
-    response = {
+def error_response(message, status_code=500):
+    return jsonify({
         "status": "error",
         "message": message,
         "timestamp": datetime.utcnow().isoformat() + "Z"
-    }
-    if details:
-        response["details"] = details
-    return jsonify(response), status_code
+    }), status_code
 
 def success_response(data, meta=None):
     response = {
         "status": "success",
-        "timestamp": datetime.utcnow().
-isoformat() + "Z",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
         "data": data
     }
     if meta:
@@ -139,102 +103,140 @@ isoformat() + "Z",
     return jsonify(response)
 
 # ───────────────────────────────────────────────
-# API Request Helper
+# Temu Scraper using Bright Data
 # ───────────────────────────────────────────────
-def parse_api_request(endpoint, payload, timeout=30):
-    """Send request to Parse.bot API with full error handling"""
-    url = f"{PARSE_API}/{endpoint}"
+def scrape_temu_search(keyword, limit=20, offset=0):
+    """Scrape Temu search results using Bright Data proxy"""
+
+    encoded_keyword = quote(keyword)
+    url = f"https://www.temu.com/api/search?search_key={encoded_keyword}&page={offset//limit + 1}&size={limit}"
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"https://www.temu.com/search_result.html?search_key={encoded_keyword}",
+    }
+
     try:
-        logger.info(f"API Request: {endpoint} | Payload: {json.dumps(payload)[:200]}")
-        response = requests.post(url, headers=HEADERS, json=payload, timeout=timeout)
+        logger.info(f"Scraping Temu: keyword='{keyword}', limit={limit}, offset={offset}")
 
-        if response.status_code == 429:
-            logger.warning(f"Rate limit hit on {endpoint}")
-            return None, "Rate limit reached. Please wait and try again.", 429
+        response = requests.get(
+            url,
+            headers=headers,
+            proxies=PROXIES,
+            timeout=60,
+            verify=True
+        )
 
-        if response.status_code == 401:
-            logger.error(f"Authentication failed on {endpoint}")
-            return None, "API authentication failed. Check your API key.", 401
-
-        if response.status_code == 403:
-            return None, "Access forbidden. Check API permissions.", 403
-
-        if response.status_code >= 500:
-            logger.error(f"Parse API server error: {response.status_code}")
-            return None, f"Parse API server error: {response.status_code}", 502
+        logger.info(f"Response status: {response.status_code}")
 
         if response.status_code != 200:
-            return None, f"Parse API returned status {response.status_code}", response.status_code
+            logger.error(f"Temu returned status {response.status_code}")
+            return None, f"Temu returned status {response.status_code}"
 
-        data = response.json()
-        logger.info(f"API Response: {endpoint} | Status: OK")
-        return data, None, 200
-
-    except requests.exceptions.Timeout:
-        logger.error(f"Timeout on {endpoint}")
-        return None, "Request timed out. The API is taking too long to respond.", 504
-    except requests.exceptions.ConnectionError:
-        logger.error(f"Connection error on {endpoint}")
-        return None, "Cannot connect to Parse API. Check your internet connection.", 502
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Request error on {endpoint}: {str(e)}")
-        return None, f"Network error: {str(e)}", 502
-    except json.JSONDecodeError:
-        logger.error(f"Invalid JSON response from {endpoint}")
-        return None, "Invalid response format from API.", 500
-
-# ───────────────────────────────────────────────
-# Product Data Cleaner
-# ───────────────────────────────────────────────
-def clean_product(p):
-    """Standardize product data from Parse API"""
-    price = p.get("price")
-    original_price = p.get("market_price")
-
-    # Calculate discount if not provided
-    discount = p.get("discount_percent", 0)
-    if not discount and price and original_price:
+        # Try to parse JSON response
         try:
-            discount = round((1 - float(price) / float(original_price)) * 100)
-        except (ValueError, ZeroDivisionError):
-            discount = 0
+            data = response.json()
+        except:
+            # If not JSON, try to extract from HTML
+            html = response.text
+            # Look for JSON data in script tags
+            match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', html, re.DOTALL)
+            if match:
+                data = json.loads(match.group(1))
+            else:
+                return None, "Could not parse response"
 
-    return {
-        "id": p.get("product_id") or p.get("id"),
-        "title": p.get("title", "Untitled Product"),
-        "price": price if price else "N/A",
-        "original_price": original_price,
-        "discount_percent": discount,
-        "currency": p.get("currency", "USD"),
-        "rating": round(float(p.get("rating", 0) or 0), 1),
-        "review_count": int(p.get("review_count", 0) or 0),
-        "sold_count": p.get("sold_count", 0),
-        "thumbnail": p.get("thumbnail", ""),
-        "product_url": p.get("product_url", ""),
-        "shipping_days": p.get("shipping_days", ""),
-        "category": p.get("category", ""),
-        "shop_name": p.get("shop_name", ""),
-        "shop_rating": p.get("shop_rating", 0),
-        "free_shipping": p.get("free_shipping", False),
-        "tags": p.get("tags", [])
-    }
+        return data, None
+
+    except requests.exceptions.ProxyError as e:
+        logger.error(f"Proxy error: {str(e)}")
+        return None, "Proxy connection failed. Check Bright Data credentials."
+    except requests.exceptions.Timeout:
+        logger.error("Request timeout")
+        return None, "Request timed out"
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+        return None, f"Error: {str(e)}"
+
+# ───────────────────────────────────────────────
+# Product Parser
+# ───────────────────────────────────────────────
+def parse_temu_products(raw_data):
+    """Parse raw Temu response into standardized product format"""
+    products = []
+
+    if not raw_data:
+        return products
+
+    # Try different response structures
+    items = []
+
+    if isinstance(raw_data, dict):
+        # Try common Temu response keys
+        if "result" in raw_data and isinstance(raw_data["result"], dict):
+            items = raw_data["result"].get("goods_list", []) or raw_data["result"].get("items", [])
+        elif "goods_list" in raw_data:
+            items = raw_data["goods_list"]
+        elif "items" in raw_data:
+            items = raw_data["items"]
+        elif "data" in raw_data and isinstance(raw_data["data"], dict):
+            items = raw_data["data"].get("goods_list", []) or raw_data["data"].get("items", [])
+        elif "data" in raw_data and isinstance(raw_data["data"], list):
+            items = raw_data["data"]
+    elif isinstance(raw_data, list):
+        items = raw_data
+
+    for item in items:
+        try:
+            product = {
+                "id": str(item.get("goods_id", item.get("id", ""))),
+                "title": item.get("goods_name", item.get("title", "Untitled Product")),
+                "price": str(item.get("price", item.get("sale_price", item.get("min_on_sale_price", "N/A")))),
+                "original_price": str(item.get("market_price", item.get("original_price", ""))),
+                "discount_percent": 0,
+                "currency": item.get("currency", "USD"),
+                "rating": round(float(item.get("avg_star", item.get("rating", 0)) or 0), 1),
+                "review_count": int(item.get("comment_num", item.get("review_count", 0)) or 0),
+                "sold_count": item.get("sales_tip", item.get("sold_count", "")),
+                "thumbnail": item.get("thumb_url", item.get("image", item.get("img_url", ""))),
+                "product_url": f"https://www.temu.com/item.html?goods_id={item.get('goods_id', item.get('id', ''))}",
+                "shipping_days": item.get("shipping_days", ""),
+                "category": item.get("cat_id", ""),
+                "shop_name": item.get("mall_name", item.get("shop_name", "")),
+                "shop_rating": item.get("mall_rating", 0),
+                "free_shipping": item.get("is_free_shipping", False),
+                "tags": item.get("tag_list", []) or []
+            }
+
+            # Calculate discount
+            try:
+                price = float(product["price"]) if product["price"] and product["price"] != "N/A" else 0
+                original = float(product["original_price"]) if product["original_price"] else 0
+                if original > 0 and price > 0:
+                    product["discount_percent"] = round((1 - price / original) * 100)
+            except:
+                pass
+
+            products.append(product)
+        except Exception as e:
+            logger.warning(f"Failed to parse product: {e}")
+            continue
+
+    return products
 
 # ───────────────────────────────────────────────
 # API Endpoints
 # ───────────────────────────────────────────────
 
 @app.route("/api/search", methods=["GET"])
-@limiter.limit("30 per minute")
 def search_products():
-    """
-    Search products by keyword
-    Query params: q (required), limit (default 20, max 50), offset (default 0), sort (default relevance)
-    """
+    """Search products on Temu"""
     keyword = request.args.get("q", "").strip()
     limit = min(int(request.args.get("limit", 20)), 50)
     offset = max(int(request.args.get("offset", 0)), 0)
-    sort = request.args.get("sort", "relevance")  # relevance, price_asc, price_desc, rating, sold
-    locale = request.args.get("locale", "en")
+    sort = request.args.get("sort", "relevance")
 
     if not keyword:
         return error_response("Search keyword is required", 400)
@@ -243,35 +245,26 @@ def search_products():
         return error_response("Keyword must be at least 2 characters", 400)
 
     # Check cache
-    cached = cache.get("search", keyword, limit, offset, sort, locale)
+    cached = cache.get("search", keyword, limit, offset, sort)
     if cached:
         return success_response(cached["data"], cached.get("meta"))
 
-    payload = {
-        "query": keyword,
-        "limit": limit,
-        "offset": offset,
-        "locale": locale,
-        "sort": sort
-    }
-
-    data, error, status = parse_api_request("search_products", payload)
+    # Scrape Temu
+    raw_data, error = scrape_temu_search(keyword, limit, offset)
     if error:
-        return error_response(error, status)
+        return error_response(error, 502)
 
-    products_raw = data.get("data", {}).get("products", [])
-    total = data.get("data", {}).get("total", len(products_raw))
-
-    cleaned = [clean_product(p) for p in products_raw]
+    products = parse_temu_products(raw_data)
+    total = len(products)  # Temu doesn't always return total count
 
     result = {
         "keyword": keyword,
-        "products": cleaned,
+        "products": products,
         "total": total,
-        "returned": len(cleaned),
+        "returned": len(products),
         "offset": offset,
         "limit": limit,
-        "has_more": (offset + len(cleaned)) < total
+        "has_more": len(products) >= limit
     }
 
     meta = {
@@ -279,462 +272,215 @@ def search_products():
         "total_pages": (total + limit - 1) // limit if limit > 0 else 1
     }
 
-    cache.set({"data": result, "meta": meta}, "search", keyword, limit, offset, sort, locale)
+    cache.set({"data": result, "meta": meta}, "search", keyword, limit, offset, sort)
     return success_response(result, meta)
 
 
 @app.route("/api/product/<product_id>", methods=["GET"])
-@limiter.limit("60 per minute")
 def get_product(product_id):
-    """
-    Get full product details including images
-    """
-    if not product_id or not product_id.strip():
+    """Get product details from Temu"""
+    if not product_id:
         return error_response("Product ID is required", 400)
 
-    # Check cache
     cached = cache.get("product", product_id)
     if cached:
         return success_response(cached["data"])
 
-    # Fetch product details
-    detail_data, error, status = parse_api_request("get_product_details", {
-        "product_id": product_id
-    })
-    if error:
-        return error_response(error, status)
+    # Scrape product page
+    url = f"https://www.temu.com/item.html?goods_id={product_id}"
 
-    detail = detail_data.get("data", {})
-
-    # Fetch product images
-    img_data, img_error, _ = parse_api_request("get_product_images", {
-        "product_ids": json.dumps([str(product_id)])
-    })
-
-    images = []
-    if not img_error and img_data:
-        for item in img_data.get("data", {}).get("results", []):
-            if item.get("status") == "success":
-                urls = item.get("image_urls", "")
-                images = [u.strip() for u in urls.split(",") if u.strip()]
-
-    # Fetch reviews if available
-    reviews_data, _, _ = parse_api_request("get_product_reviews", {
-        "product_id": product_id,
-        "limit": 5
-    })
-    reviews = []
-    if reviews_data:
-        reviews = reviews_data.get("data", {}).get("reviews", [])
-
-    result = {
-        "id": product_id,
-        "title": detail.get("title", "Untitled"),
-        "description": detail.get("description", ""),
-        "price": detail.get("price", "N/A"),
-        "original_price": detail.get("market_price"),
-        "discount_percent": detail.get("discount_percent", 0),
-        "currency": detail.get("currency", "USD"),
-        "rating": round(float(detail.get("rating", 0) or 0), 1),
-        "review_count": int(detail.get("review_count", 0) or 0),
-        "sold_count": detail.get("sold_count", 0),
-        "category": detail.get("category", ""),
-        "subcategory": detail.get("subcategory", ""),
-        "product_url": detail.get("product_url", ""),
-        "video_url": detail.get("video_url", ""),
-        "thumbnail": detail.get("thumbnail", ""),
-        "images": images,
-        "shop": {
-            "name": detail.get("shop_name", ""),
-            "rating": detail.get("shop_rating", 0),
-            "url": detail.get("shop_url", "")
-        },
-        "shipping": {
-            "days": detail.get("shipping_days", ""),
-            "free": detail.get("free_shipping", False),
-            "cost": detail.
-get("shipping_cost", 0)
-        },
-        "specifications": detail.get("specifications", {}),
-        "reviews": reviews,
-        "tags": detail.get("tags", [])
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
     }
 
-    cache.set({"data": result}, "product", product_id)
-    return success_response(result)
+    try:
+        response = requests.get(url, headers=headers, proxies=PROXIES, timeout=60)
+        html = response.text
 
+        # Extract product data from HTML
+        # Look for JSON data in script tags
+        match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', html, re.DOTALL)
+        if match:
+            data = json.loads(match.group(1))
+            # Parse product details...
+            result = {
+                "id": product_id,
+                "title": data.get("goodsName", "Untitled"),
+                "description": data.get("goodsDesc", ""),
+                "price": str(data.get("salePrice", "N/A")),
+                "original_price": str(data.get("marketPrice", "")),
+                "currency": "USD",
+                "rating": round(float(data.get("avgStar", 0) or 0), 1),
+                "review_count": int(data.get("commentNum", 0) or 0),
+                "sold_count": data.get("salesTip", ""),
+                "thumbnail": data.get("thumbUrl", ""),
+                "images": data.get("viewImageList", []),
+                "shop": {
+                    "name": data.get("mallName", ""),
+                    "rating": data.get("mallRating", 0),
+                },
+                "shipping": {
+                    "free": data.get("isFreeShipping", False),
+                },
+                "specifications": data.get("specs", {}),
+                "reviews": [],
+                "tags": data.get("tagList", [])
+            }
+        else:
+            result = {"id": product_id, "error": "Could not extract product data"}
 
-@app.route("/api/product/<product_id>/images", methods=["GET"])
-@limiter.limit("60 per minute")
-def get_product_images(product_id):
-    """Get product images only"""
-    if not product_id:
-        return error_response("Product ID is required", 400)
+        cache.set({"data": result}, "product", product_id)
+        return success_response(result)
 
-    cached = cache.get("images", product_id)
-    if cached:
-        return success_response(cached["data"])
-
-    img_data, error, status = parse_api_request("get_product_images", {
-        "product_ids": json.dumps([str(product_id)])
-    })
-
-    if error:
-        return error_response(error, status)
-
-    images = []
-    for item in img_data.get("data", {}).get("results", []):
-        if item.get("status") == "success":
-            urls = item.get("image_urls", "")
-            images = [u.strip() for u in urls.split(",") if u.strip()]
-
-    result = {"product_id": product_id, "images": images, "count": len(images)}
-    cache.set({"data": result}, "images", product_id)
-    return success_response(result)
-
-
-@app.route("/api/product/<product_id>/reviews", methods=["GET"])
-@limiter.limit("30 per minute")
-def get_product_reviews(product_id):
-    """Get product reviews with pagination"""
-    if not product_id:
-        return error_response("Product ID is required", 400)
-
-    limit = min(int(request.args.get("limit", 10)), 50)
-    offset = max(int(request.args.get("offset", 0)), 0)
-    sort = request.args.get("sort", "newest")  # newest, highest, lowest
-
-    payload = {
-        "product_id": product_id,
-        "limit": limit,
-        "offset": offset,
-        "sort": sort
-    }
-
-    data, error, status = parse_api_request("get_product_reviews", payload)
-    if error:
-        return error_response(error, status)
-
-    reviews = data.get("data", {}).get("reviews", [])
-    total = data.get("data", {}).get("total", len(reviews))
-
-    result = {
-        "product_id": product_id,
-        "reviews": reviews,
-        "total": total,
-        "returned": len(reviews),
-        "offset": offset,
-        "limit": limit,
-        "has_more": (offset + len(reviews)) < total
-    }
-
-    return success_response(result)
-
-
-@app.route("/api/product/<product_id>/similar", methods=["GET"])
-@limiter.limit("30 per minute")
-def get_similar_products(product_id):
-    """Get similar/recommended products"""
-    if not product_id:
-        return error_response("Product ID is required", 400)
-
-    limit = min(int(request.args.get("limit", 10)), 20)
-
-    payload = {
-        "product_id": product_id,
-        "limit": limit
-    }
-
-    data, error, status = parse_api_request("get_similar_products", payload)
-    if error:
-        return error_response(error, status)
-
-    products_raw = data.get("data", {}).get("products", [])
-    cleaned = [clean_product(p) for p in products_raw]
-
-    result = {
-        "product_id": product_id,
-        "products": cleaned,
-        "total": len(cleaned)
-    }
-
-    return success_response(result)
-
-
-@app.route("/api/categories", methods=["GET"])
-@limiter.limit("20 per minute")
-def get_categories():
-    """Get available product categories"""
-    cached = cache.get("categories")
-    if cached:
-        return success_response(cached["data"])
-
-    data, error, status = parse_api_request("get_categories", {})
-    if error:
-        return error_response(error, status)
-
-    categories = data.get("data", {}).get("categories", [])
-    cache.set({"data": categories}, "categories")
-    return success_response(categories)
-
-
-@app.route("/api/category/<category_id>/products", methods=["GET"])
-@limiter.limit("30 per minute")
-def get_category_products(category_id):
-    """Get products by category"""
-    limit = min(int(request.args.get("limit", 20)), 50)
-    offset = max(int(request.args.get("offset", 0)), 0)
-    sort = request.args.get("sort", "relevance")
-
-    payload = {
-        "category_id": category_id,
-        "limit": limit,
-"offset": offset,
-        "sort": sort
-    }
-
-    data, error, status = parse_api_request("get_category_products", payload)
-    if error:
-        return error_response(error, status)
-
-    products_raw = data.get("data", {}).get("products", [])
-    total = data.get("data", {}).get("total", len(products_raw))
-    cleaned = [clean_product(p) for p in products_raw]
-
-    result = {
-        "category_id": category_id,
-        "products": cleaned,
-        "total": total,
-        "returned": len(cleaned),
-        "offset": offset,
-        "limit": limit,
-        "has_more": (offset + len(cleaned)) < total
-    }
-
-    return success_response(result)
+    except Exception as e:
+        return error_response(f"Failed to fetch product: {str(e)}", 502)
 
 
 @app.route("/api/trending", methods=["GET"])
-@limiter.limit("20 per minute")
 def get_trending():
-    """Get trending products"""
+    """Get trending products from Temu"""
     limit = min(int(request.args.get("limit", 20)), 50)
 
     cached = cache.get("trending", limit)
     if cached:
         return success_response(cached["data"])
 
-    payload = {"limit": limit}
-    data, error, status = parse_api_request("get_trending_products", payload)
-    if error:
-        return error_response(error, status)
+    # Scrape Temu homepage/trending
+    url = "https://www.temu.com/api/home/recommend"
 
-    products_raw = data.get("data", {}).get("products", [])
-    cleaned = [clean_product(p) for p in products_raw]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.temu.com/",
+    }
 
-    result = {"products": cleaned, "total": len(cleaned)}
-    cache.set({"data": result}, "trending", limit)
-    return success_response(result)
+    try:
+        response = requests.get(url, headers=headers, proxies=PROXIES, timeout=60)
+        data = response.json()
+        products = parse_temu_products(data)
+
+        result = {"products": products[:limit], "total": len(products[:limit])}
+        cache.set({"data": result}, "trending", limit)
+        return success_response(result)
+
+    except Exception as e:
+        return error_response(f"Failed to fetch trending: {str(e)}", 502)
 
 
 @app.route("/api/deals", methods=["GET"])
-@limiter.limit("20 per minute")
 def get_deals():
-    """Get products with best discounts"""
+    """Get deals from Temu"""
     limit = min(int(request.args.get("limit", 20)), 50)
-    min_discount = int(request.args.get("min_discount", 50))  # Minimum discount %
+    min_discount = int(request.args.get("min_discount", 50))
 
     cached = cache.get("deals", limit, min_discount)
     if cached:
         return success_response(cached["data"])
 
-    payload = {
-        "limit": limit,
-        "min_discount": min_discount
-    }
+    # Scrape Temu deals page
+    url = f"https://www.temu.com/api/deals?limit={limit}"
 
-    data, error, status = parse_api_request("get_deals", payload)
-    if error:
-        return error_response(error, status)
+    try:
+        response = requests.get(url, headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
+        }, proxies=PROXIES, timeout=60)
 
-    products_raw = data.get("data", {}).get("products", [])
-    cleaned = [clean_product(p) for p in products_raw]
+        data = response.json()
+        products = parse_temu_products(data)
 
-    result = {
-        "products": cleaned,
-        "total": len(cleaned),
-        "min_discount": min_discount
-    }
-    cache.set({"data": result}, "deals", limit, min_discount)
-    return success_response(result)
+        # Filter by discount
+        filtered = [p for p in products if p.get("discount_percent", 0) >= min_discount]
 
-
-# ───────────────────────────────────────────────
-# System Endpoints
-# ───────────────────────────────────────────────
-
-@app.route("/", methods=["GET"])
-def home():
-    """API Home / Documentation"""
-    return jsonify({
-        "name": "Temu API",
-        "version": "2.0.0",
-        "status": "online",
-        "provider": "Parse.bot",
-        "documentation": "/api/docs",
-        "endpoints": {
-            "search": "/api/search?q=keyword&limit=20&offset=0",
-            "product_details": "/api/product/<id>",
-            "product_images": "/api/product/<id>/images",
-            "product_reviews": "/api/product/<id>/reviews?limit=10&offset=0",
-            "similar_products": "/api/product/<id>/similar?limit=10",
-            "categories": "/api/categories",
-            "category_products": "/api/category/<id>/products?limit=20",
-            "trending": "/api/trending?limit=20",
-            "deals": "/api/deals?limit=20&min_discount=50",
-            "health": "/api/health",
-            "cache_stats": "/api/cache/stats",
-            "clear_cache": "/api/cache/clear"
+        result = {
+            "products": filtered,
+            "total": len(filtered),
+            "min_discount": min_discount
         }
-    })
+        cache.set({"data": result}, "deals", limit, min_discount)
+        return success_response(result)
+
+    except Exception as e:
+        return error_response(f"Failed to fetch deals: {str(e)}", 502)
 
 
-@app.route("/api/docs", methods=["GET"])
-def docs():
-    """API Documentation"""
-    return jsonify({
-        "title": "Temu API Documentation",
-        "base_url": "/api",
-        "authentication": "None required (API key managed server-side)",
-        "rate_limits": "30-60 requests/minute per endpoint",
-        "endpoints": [
-            {
-                "path": "/search",
-                "method": "GET",
-                "description": "Search products by keyword",
-                "params": {
-                    "q": "Search keyword (required, min 2 chars)",
-                    "limit": "Results per page (default 20, max 50)",
-"offset": "Pagination offset (default 0)",
-                    "sort": "Sort order: relevance, price_asc, price_desc, rating, sold",
-                    "locale": "Language code (default: en)"
-                }
-            },
-            {
-                "path": "/product/<id>",
-                "method": "GET",
-                "description": "Get full product details with images and reviews"
-            },
-            {
-                "path": "/product/<id>/images",
-                "method": "GET",
-                "description": "Get product images only"
-            },
-            {
-                "path": "/product/<id>/reviews",
-                "method": "GET",
-                "description": "Get product reviews",
-                "params": {
-                    "limit": "Reviews per page (default 10, max 50)",
-                    "offset": "Pagination offset",
-                    "sort": "newest, highest, lowest"
-                }
-            },
-            {
-                "path": "/product/<id>/similar",
-                "method": "GET",
-                "description": "Get similar/recommended products"
-            },
-            {
-                "path": "/categories",
-                "method": "GET",
-                "description": "Get all product categories"
-            },
-            {
-                "path": "/category/<id>/products",
-                "method": "GET",
-                "description": "Get products in a category"
-            },
-            {
-                "path": "/trending",
-                "method": "GET",
-                "description": "Get trending products"
-            },
-            {
-                "path": "/deals",
-                "method": "GET",
-                "description": "Get products with best discounts",
-                "params": {
-                    "min_discount": "Minimum discount percentage (default 50)"
-                }
-            }
-        ]
-    })
+@app.route("/api/categories", methods=["GET"])
+def get_categories():
+    """Get product categories"""
+    categories = [
+        {"id": "100", "name": "Women's Clothing", "icon": "👗"},
+        {"id": "200", "name": "Men's Clothing", "icon": "👔"},
+        {"id": "300", "name": "Shoes", "icon": "👟"},
+        {"id": "400", "name": "Electronics", "icon": "📱"},
+        {"id": "500", "name": "Home & Kitchen", "icon": "🏠"},
+        {"id": "600", "name": "Beauty & Health", "icon": "💄"},
+        {"id": "700", "name": "Jewelry & Accessories", "icon": "💍"},
+        {"id": "800", "name": "Sports & Outdoors", "icon": "⚽"},
+        {"id": "900", "name": "Toys & Games", "icon": "🎮"},
+        {"id": "1000", "name": "Automotive", "icon": "🚗"},
+    ]
+    return success_response(categories)
 
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    """Health Check"""
+    """Health check"""
     return jsonify({
         "status": "healthy",
-        "service": "temu-api",
-        "version": "2.0.0",
+        "service": "temu-api-brightdata",
+        "version": "3.0.0",
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "cache": cache.stats(),
-        "parse_api": PARSE_API
+        "proxy": "brightdata-web-unlocker"
     })
 
 
-@app.route("/api/cache/stats", methods=["GET"])
-def cache_stats():
-    """Get cache statistics"""
+@app.route("/", methods=["GET"])
+def home():
+    """API Documentation"""
     return jsonify({
-        "status": "success",
-        "cache": cache.stats()
+        "name": "Temu API - Bright Data Edition",
+        "version": "3.0.0",
+        "status": "online",
+        "provider": "Bright Data Web Unlocker",
+        "endpoints": {
+            "search": "/api/search?q=keyword&limit=20&offset=0",
+            "product_details": "/api/product/<id>",
+            "trending": "/api/trending?limit=20",
+            "deals": "/api/deals?limit=20&min_discount=50",
+            "categories": "/api/categories",
+            "health": "/api/health"
+        }
     })
-
-
-@app.route("/api/cache/clear", methods=["POST"])
-def clear_cache():
-    """Clear all cached data"""
-    cache.clear()
-    return jsonify({"status": "success", "message": "Cache cleared successfully"})
 
 
 # ───────────────────────────────────────────────
 # Error Handlers
 # ───────────────────────────────────────────────
-
 @app.errorhandler(404)
 def not_found(error):
-    return error_response("Endpoint not found. Visit / for API documentation.", 404)
-
-@app.errorhandler(405)
-def method_not_allowed(error):
-    return error_response("Method not allowed for this endpoint", 405)
-
-@app.errorhandler(429)
-def rate_limit_exceeded(error):
-    return error_response("Rate limit exceeded. Please slow down your requests.", 429)
+    return error_response("Endpoint not found", 404)
 
 @app.errorhandler(500)
 def internal_error(error):
-    logger.error(f"Internal server error: {str(error)}")
-    return error_response("Internal server error occurred", 500)
+    logger.error(f"Internal error: {str(error)}")
+    return error_response("Internal server error", 500)
 
 
 # ───────────────────────────────────────────────
-# Main Entry Point
+# Main
 # ───────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
 
     print("=" * 60)
-    print("🚀 Temu API v2.0.0 - MCP Ready")
+    print("🚀 Temu API v3.0.0 - Bright Data Web Unlocker")
     print(f"📍 Port: {port}")
     print(f"🔧 Debug: {debug}")
-    print(f"🔗 Parse API: {PARSE_API}")
+    print(f"🔗 Proxy: {BRIGHTDATA_HOST}:{BRIGHTDATA_PORT}")
     print("=" * 60)
 
     app.run(host="0.0.0.0", port=port, debug=debug)
