@@ -1,4 +1,5 @@
-flask
-flask-cors
-requests
-gunicorn
+Flask==3.0.3
+Flask-Cors==4.0.1
+Flask-Limiter==3.7.0
+requests==2.32.3
+gunicorn==23.0.0
